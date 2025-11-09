@@ -7,118 +7,317 @@ from collections import deque
 import random
 
 class SnakeEnv(gym.Env):
-    def __init__(self):
-        super(SnakeEnv,self).__init__()
-        self.size=10
-        self.actionSpace=gym.spaces.Discrete(4)
-        self.observationSpace=gym.spaces.Box(low=0,high=1,shape=(self.size,self.size,3),dtype=np.float32)
+    def __init__(self, size=1000):
+        super(SnakeEnv, self).__init__()
+        self.size = size
+        self.actionSpace = gym.spaces.Discrete(4)
+        # Use compact state representation instead of full grid
+        self.observationSpace = gym.spaces.Box(low=-1, high=1, shape=(24,), dtype=np.float32)
         self.reset()
 
     def reset(self):
-        self.snake=[[5,5]]
-        self.direction=0
-        self.food=self._placeFood()
-        self.done=False
+        center = self.size // 2
+        self.snake = [[center, center]]
+        self.direction = 0
+        self.food = self._placeFood()
+        self.done = False
+        self.steps = 0
+        self.score = 0
         return self._getState()
 
-    def step(self,action):
-        if abs(action-self.direction)!=2:
-            self.direction=action
-        head=self.snake[0].copy()
-        if self.direction==0: head[1]-=1
-        elif self.direction==1: head[0]+=1
-        elif self.direction==2: head[1]+=1
-        else: head[0]-=1
-        reward=0
+    def step(self, action):
+        if abs(action - self.direction) != 2:
+            self.direction = action
+        
+        head = self.snake[0].copy()
+        if self.direction == 0: head[1] -= 1
+        elif self.direction == 1: head[0] += 1
+        elif self.direction == 2: head[1] += 1
+        else: head[0] -= 1
+        
+        reward = 0
+        self.steps += 1
+        
+        # Check collision
         if self._isCollision(head):
-            self.done=True
-            reward=-1
-            return self._getState(),reward,self.done,{}
-        if head==self.food:
-            self.snake.insert(0,head)
-            reward=1
-            self.food=self._placeFood()
+            self.done = True
+            reward = -10
+            return self._getState(), reward, self.done, {}
+        
+        # Check if food eaten
+        if head == self.food:
+            self.snake.insert(0, head)
+            self.score += 1
+            reward = 10
+            self.food = self._placeFood()
+            self.steps = 0
         else:
-            self.snake.insert(0,head)
-            self.snake.pop()
-        return self._getState(),reward,self.done,{}
+            self.snake.insert(0, head)
+            old_head = self.snake.pop()
+            
+            # Reward for moving toward food
+            old_dist = abs(old_head[0] - self.food[0]) + abs(old_head[1] - self.food[1])
+            new_dist = abs(head[0] - self.food[0]) + abs(head[1] - self.food[1])
+            if new_dist < old_dist:
+                reward += 0.1
+            else:
+                reward -= 0.05
+        
+        # Timeout if snake is stuck (scaled for large grid and snake length)
+        max_steps = 200 + len(self.snake) * 50
+        if self.steps > max_steps:
+            self.done = True
+            reward -= 5
+        
+        return self._getState(), reward, self.done, {}
 
     def _getState(self):
-        state=np.zeros((self.size,self.size,3),dtype=np.float32)
-        for x,y in self.snake:
-            if 0<=x<self.size and 0<=y<self.size:
-                state[y,x,0]=1
-        fx,fy=self.food
-        state[fy,fx,1]=1
+        """
+        Compact state representation for 1000x1000 grid:
+        - 8 danger sensors (surrounding cells)
+        - 4 direction indicators
+        - 4 food direction indicators (normalized)
+        - 4 distance to walls (normalized)
+        - 4 additional features (snake length, steps, etc.)
+        Total: 24 features
+        """
+        head = self.snake[0]
+        state = np.zeros(24, dtype=np.float32)
+        
+        # 0-7: Danger in 8 directions (binary)
+        directions = [
+            [0, -1], [1, -1], [1, 0], [1, 1],
+            [0, 1], [-1, 1], [-1, 0], [-1, -1]
+        ]
+        for i, (dx, dy) in enumerate(directions):
+            check_pos = [head[0] + dx, head[1] + dy]
+            state[i] = 1.0 if self._isCollision(check_pos) else 0.0
+        
+        # 8-11: Current direction (one-hot)
+        state[8 + self.direction] = 1.0
+        
+        # 12-15: Food direction (normalized)
+        food_dx = self.food[0] - head[0]
+        food_dy = self.food[1] - head[1]
+        food_dist = max(abs(food_dx), abs(food_dy), 1)
+        
+        state[12] = 1.0 if food_dy < 0 else 0.0  # Food up
+        state[13] = 1.0 if food_dx > 0 else 0.0  # Food right
+        state[14] = 1.0 if food_dy > 0 else 0.0  # Food down
+        state[15] = 1.0 if food_dx < 0 else 0.0  # Food left
+        
+        # 16-19: Distance to walls (normalized)
+        state[16] = head[1] / self.size  # Distance to top
+        state[17] = (self.size - head[0] - 1) / self.size  # Distance to right
+        state[18] = (self.size - head[1] - 1) / self.size  # Distance to bottom
+        state[19] = head[0] / self.size  # Distance to left
+        
+        # 20-23: Additional features
+        state[20] = min(len(self.snake) / 100.0, 1.0)  # Snake length (capped)
+        state[21] = min(food_dist / 1000.0, 1.0)  # Distance to food (normalized for large grid)
+        state[22] = min(self.steps / 1000.0, 1.0)  # Steps since last food
+        state[23] = self.score / 100.0  # Score (normalized)
+        
         return state
 
     def _placeFood(self):
-        while True:
-            pos=[np.random.randint(0,self.size),np.random.randint(0,self.size)]
-            if pos not in self.snake:
+        """Optimized food placement - start close for early training"""
+        head = self.snake[0]
+        
+        # Place food nearby during early training (when snake is short)
+        if len(self.snake) < 20:
+            max_distance = min(50, self.size // 4)
+            for _ in range(100):
+                dx = np.random.randint(-max_distance, max_distance)
+                dy = np.random.randint(-max_distance, max_distance)
+                pos = [
+                    max(0, min(self.size - 1, head[0] + dx)),
+                    max(0, min(self.size - 1, head[1] + dy))
+                ]
+                if pos not in self.snake[:min(len(self.snake), 50)]:
+                    return pos
+        
+        # Random placement for later training
+        for _ in range(100):
+            pos = [np.random.randint(0, self.size), np.random.randint(0, self.size)]
+            if pos not in self.snake[:min(len(self.snake), 50)]:
                 return pos
+        
+        # Fallback
+        return [
+            (head[0] + 10) % self.size,
+            (head[1] + 10) % self.size
+        ]
 
-    def _isCollision(self,head):
-        x,y=head
-        return x<0 or y<0 or x>=self.size or y>=self.size or head in self.snake[1:]
+    def _isCollision(self, head):
+        x, y = head
+        if x < 0 or y < 0 or x >= self.size or y >= self.size:
+            return True
+        # Only check recent snake segments for self-collision (optimization)
+        recent_snake = self.snake[1:min(len(self.snake), 100)]
+        return head in recent_snake
+    
+    def get_valid_actions(self):
+        """Returns list of actions that won't immediately kill the snake"""
+        valid = []
+        head = self.snake[0].copy()
+        
+        for action in range(4):
+            if abs(action - self.direction) == 2:
+                continue
+            
+            test_head = head.copy()
+            if action == 0: test_head[1] -= 1
+            elif action == 1: test_head[0] += 1
+            elif action == 2: test_head[1] += 1
+            else: test_head[0] -= 1
+            
+            if not self._isCollision(test_head):
+                valid.append(action)
+        
+        return valid if valid else [self.direction]
+
 
 class DQN(nn.Module):
-    def __init__(self,obsShape,nActions):
-        super(DQN,self).__init__()
-        self.net=nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(np.prod(obsShape),128),
+    def __init__(self, state_dim, nActions):
+        super(DQN, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, 256),
             nn.ReLU(),
-            nn.Linear(128,nActions)
+            nn.Dropout(0.2),
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, nActions)
         )
-    def forward(self,x):
+    
+    def forward(self, x):
         return self.net(x)
 
-if __name__ == "__main__":
-    env=SnakeEnv()
-    obsShape=env.observationSpace.shape
-    nActions=env.actionSpace.n
-    model=DQN(obsShape,nActions)
-    optimizer=optim.Adam(model.parameters(),lr=1e-3)
-    memory=deque(maxlen=10000)
-    batchSize=32
-    gamma=0.9
-    epsilon=1.0
-    decay=0.995
 
-    for episode in range(2000):
-        state=env.reset()
-        totalReward=0
+if __name__ == "__main__":
+    total_episodes = 6000
+    
+    # Curriculum learning: start small, scale up percentually
+    curriculum = [
+        (0.0, 50),      # 0-10%: 50x50
+        (0.10, 100),    # 10-25%: 100x100
+        (0.25, 200),    # 25-40%: 200x200
+        (0.40, 500),    # 40-65%: 500x500
+        (0.65, 1000),   # 65-100%: 1000x1000
+    ]
+    
+    state_dim = 24
+    nActions = 4
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
+    model = DQN(state_dim, nActions).to(device)
+    target_model = DQN(state_dim, nActions).to(device)
+    target_model.load_state_dict(model.state_dict())
+    
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    memory = deque(maxlen=50000)
+    batchSize = 128
+    gamma = 0.99
+    epsilon = 1.0
+    epsilon_min = 0.01
+    decay = 0.9995
+    target_update = 20
+    train_freq = 4  # Train every N steps instead of every step
+    
+    best_score = 0
+    episode_rewards = deque(maxlen=100)
+    
+    # Start with smallest grid
+    current_size = curriculum[0][1]
+    env = SnakeEnv(size=current_size)
+    print(f"Starting curriculum training over {total_episodes} episodes")
+    print(f"Initial grid: {current_size}x{current_size}")
+    
+    for episode in range(total_episodes):
+        # Update grid size based on curriculum percentage
+        progress = episode / total_episodes
+        for threshold, size in curriculum:
+            if progress >= threshold:
+                if size != current_size:
+                    current_size = size
+                    env = SnakeEnv(size=current_size)
+                    percent = int(progress * 100)
+                    print(f"\n=== {percent}% - Scaling up to {current_size}x{current_size} grid (episode {episode}) ===\n")
+        state = env.reset()
+        totalReward = 0
+        steps = 0
+        step_count = 0
+        
         while True:
-            if np.random.rand()<epsilon:
-                action=np.random.randint(nActions)
+            valid_actions = env.get_valid_actions()
+            
+            if np.random.rand() < epsilon:
+                action = np.random.choice(valid_actions)
             else:
                 with torch.no_grad():
-                    q=model(torch.tensor(state).unsqueeze(0))
-                    action=torch.argmax(q).item()
-            nextState,reward,done,_=env.step(action)
-            memory.append((state,action,reward,nextState,done))
-            state=nextState
-            totalReward+=reward
+                    state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+                    q = model(state_tensor)
+                    q_masked = q[0].clone()
+                    invalid = [a for a in range(nActions) if a not in valid_actions]
+                    q_masked[invalid] = -float('inf')
+                    action = torch.argmax(q_masked).item()
+            
+            nextState, reward, done, _ = env.step(action)
+            memory.append((state, action, reward, nextState, done))
+            state = nextState
+            totalReward += reward
+            steps += 1
+            step_count += 1
+            
             if done:
                 break
-            if len(memory)>batchSize:
-                batch=random.sample(memory,batchSize)
-                states,actions,rewards,nextStates,dones=zip(*batch)
-                states=torch.tensor(np.array(states))
-                actions=torch.tensor(actions)
-                rewards=torch.tensor(rewards)
-                nextStates=torch.tensor(np.array(nextStates))
-                dones=torch.tensor(dones)
-                qValues=model(states).gather(1,actions.unsqueeze(1)).squeeze(1)
-                nextQ=model(nextStates).max(1)[0]
-                target=rewards+gamma*nextQ*(1-dones.float())
-                loss=nn.functional.mse_loss(qValues,target)
+            
+            # Training step (only every train_freq steps for speed)
+            if len(memory) > batchSize * 2 and step_count % train_freq == 0:
+                batch = random.sample(memory, batchSize)
+                states, actions, rewards, nextStates, dones = zip(*batch)
+                
+                states = torch.FloatTensor(np.array(states)).to(device)
+                actions = torch.LongTensor(actions).to(device)
+                rewards = torch.FloatTensor(rewards).to(device)
+                nextStates = torch.FloatTensor(np.array(nextStates)).to(device)
+                dones = torch.FloatTensor(dones).to(device)
+                
+                qValues = model(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+                
+                with torch.no_grad():
+                    nextQ = target_model(nextStates).max(1)[0]
+                    target = rewards + gamma * nextQ * (1 - dones)
+                
+                loss = nn.functional.mse_loss(qValues, target)
+                
                 optimizer.zero_grad()
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
-        epsilon*=decay
-        print(f"Episode {episode+1}: reward={totalReward:.2f}, epsilon={epsilon:.3f}")
-
-    torch.save(model.state_dict(),"snake_model.pth")
-    print("Model saved as snake_model.pth")
+        
+        epsilon = max(epsilon_min, epsilon * decay)
+        episode_rewards.append(totalReward)
+        
+        if episode % target_update == 0:
+            target_model.load_state_dict(model.state_dict())
+        
+        if env.score > best_score:
+            best_score = env.score
+            torch.save(model.state_dict(), "snake_model_best.pth")
+        
+        if episode % 50 == 0:
+            avg_reward = np.mean(episode_rewards) if episode_rewards else 0
+            print(f"Ep {episode} [{current_size}x{current_size}]: reward={totalReward:.1f}, "
+                  f"avg={avg_reward:.1f}, score={env.score}, steps={steps}, "
+                  f"eps={epsilon:.3f}, best={best_score}")
+    
+    torch.save(model.state_dict(), "snake_model_final.pth")
+    print(f"\nTraining complete! Best score: {best_score}")
+    print(f"Final grid size: {current_size}x{current_size}")
+    print("Models saved as snake_model_best.pth and snake_model_final.pth")
