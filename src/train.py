@@ -19,10 +19,16 @@ class SnakeEnv(gym.Env):
         center = self.size // 2
         self.snake = [[center, center]]
         self.direction = 0
-        self.food = self._placeFood()
+        #self.food = self._placeFood()
         self.done = False
         self.steps = 0
         self.score = 0
+
+        # aleatory obstacles
+        self.obstacles = self._generateObstacles()
+
+        # Place food avoiding obstacles and body
+        self.food = self._placeFood()
         return self._getState()
 
     def step(self, action):
@@ -71,16 +77,26 @@ class SnakeEnv(gym.Env):
         
         return self._getState(), reward, self.done, {}
 
+    def _generateObstacles(self):
+        """
+        Genera obstáculos aleatorios en el grid.
+        La densidad se adapta al tamaño del entorno (menos obstáculos en entornos pequeños).
+        """
+        num_obstacles = max(5, self.size // 40)  # densidad proporcional
+        obstacles = set()
+
+        # Intentar colocar obstáculos en posiciones vacías
+        while len(obstacles) < num_obstacles:
+            x = np.random.randint(0, self.size)
+            y = np.random.randint(0, self.size)
+            pos = (x, y)
+            if pos not in obstacles:
+                if [x, y] not in self.snake:
+                    obstacles.add(pos)
+
+        return list(obstacles)
+
     def _getState(self):
-        """
-        Compact state representation for 1000x1000 grid:
-        - 8 danger sensors (surrounding cells)
-        - 4 direction indicators
-        - 4 food direction indicators (normalized)
-        - 4 distance to walls (normalized)
-        - 4 additional features (snake length, steps, etc.)
-        Total: 24 features
-        """
         head = self.snake[0]
         state = np.zeros(24, dtype=np.float32)
         
@@ -123,58 +139,38 @@ class SnakeEnv(gym.Env):
     def _placeFood(self):
         """Optimized food placement - start close for early training"""
         head = self.snake[0]
-        
-        # Place food nearby during early training (when snake is short)
-        if len(self.snake) < 20:
-            max_distance = min(50, self.size // 4)
-            for _ in range(100):
-                dx = np.random.randint(-max_distance, max_distance)
-                dy = np.random.randint(-max_distance, max_distance)
-                pos = [
-                    max(0, min(self.size - 1, head[0] + dx)),
-                    max(0, min(self.size - 1, head[1] + dy))
-                ]
-                if pos not in self.snake[:min(len(self.snake), 50)]:
-                    return pos
-        
-        # Random placement for later training
         for _ in range(100):
-            pos = [np.random.randint(0, self.size), np.random.randint(0, self.size)]
-            if pos not in self.snake[:min(len(self.snake), 50)]:
+            x = np.random.randint(0, self.size)
+            y = np.random.randint(0, self.size)
+            pos = [x, y]
+            if pos not in self.snake and (x, y) not in self.obstacles:
                 return pos
-        
-        # Fallback
-        return [
-            (head[0] + 10) % self.size,
-            (head[1] + 10) % self.size
-        ]
+        return [(head[0] + 10) % self.size, (head[1] + 10) % self.size]
 
     def _isCollision(self, head):
         x, y = head
         if x < 0 or y < 0 or x >= self.size or y >= self.size:
             return True
-        # Only check recent snake segments for self-collision (optimization)
-        recent_snake = self.snake[1:min(len(self.snake), 100)]
-        return head in recent_snake
-    
+        if head in self.snake[1:min(len(self.snake), 100)]:
+            return True
+        # collision with obstacles
+        if (x, y) in self.obstacles:
+            return True
+        return False
+
     def get_valid_actions(self):
-        """Returns list of actions that won't immediately kill the snake"""
         valid = []
         head = self.snake[0].copy()
-        
         for action in range(4):
             if abs(action - self.direction) == 2:
                 continue
-            
             test_head = head.copy()
             if action == 0: test_head[1] -= 1
             elif action == 1: test_head[0] += 1
             elif action == 2: test_head[1] += 1
             else: test_head[0] -= 1
-            
             if not self._isCollision(test_head):
                 valid.append(action)
-        
         return valid if valid else [self.direction]
 
 
