@@ -70,7 +70,7 @@ class SnakeEnv(gym.Env):
                 reward -= 0.05
         
         # Timeout if snake is stuck (scaled for large grid and snake length)
-        max_steps = 200 + len(self.snake) * 50
+        max_steps = 500 + len(self.snake) * 50
         if self.steps > max_steps:
             self.done = True
             reward -= 5
