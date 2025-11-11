@@ -7,11 +7,11 @@ from collections import deque
 import random
 
 class SnakeEnv(gym.Env):
-    def __init__(self, size=1000):
+    def __init__(self, size=1000, max_food_distance=None):
         super(SnakeEnv, self).__init__()
         self.size = size
+        self.max_food_distance = max_food_distance
         self.actionSpace = gym.spaces.Discrete(4)
-        # Use compact state representation instead of full grid
         self.observationSpace = gym.spaces.Box(low=-1, high=1, shape=(24,), dtype=np.float32)
         self.reset()
 
@@ -19,15 +19,14 @@ class SnakeEnv(gym.Env):
         center = self.size // 2
         self.snake = [[center, center]]
         self.direction = 0
-        #self.food = self._placeFood()
         self.done = False
         self.steps = 0
         self.score = 0
-
-        # aleatory obstacles
+        
+        # Generate obstacles - more structured patterns
         self.obstacles = self._generateObstacles()
-
-        # Place food avoiding obstacles and body
+        
+        # Place food with curriculum support
         self.food = self._placeFood()
         return self._getState()
 
@@ -69,7 +68,7 @@ class SnakeEnv(gym.Env):
             else:
                 reward -= 0.05
         
-        # Timeout if snake is stuck (scaled for large grid and snake length)
+        # Timeout penalty - increased base time
         max_steps = 500 + len(self.snake) * 50
         if self.steps > max_steps:
             self.done = True
@@ -78,22 +77,50 @@ class SnakeEnv(gym.Env):
         return self._getState(), reward, self.done, {}
 
     def _generateObstacles(self):
-        """
-        Genera obstáculos aleatorios en el grid.
-        La densidad se adapta al tamaño del entorno (menos obstáculos en entornos pequeños).
-        """
-        num_obstacles = max(5, self.size // 40)  # densidad proporcional
+        """Generate structured obstacle patterns instead of random dots"""
         obstacles = set()
-
-        # Intentar colocar obstáculos en posiciones vacías
-        while len(obstacles) < num_obstacles:
-            x = np.random.randint(0, self.size)
-            y = np.random.randint(0, self.size)
-            pos = (x, y)
-            if pos not in obstacles:
-                if [x, y] not in self.snake:
-                    obstacles.add(pos)
-
+        
+        # Reduce obstacles significantly for faster training
+        num_patterns = max(2, self.size // 300)
+        
+        for _ in range(num_patterns):
+            pattern_type = np.random.choice(['line', 'square'])  # Simplified patterns
+            
+            # Random starting position (avoid center where snake spawns)
+            center = self.size // 2
+            attempts = 0
+            while attempts < 10:
+                x = np.random.randint(self.size // 4, 3 * self.size // 4)
+                y = np.random.randint(self.size // 4, 3 * self.size // 4)
+                # Ensure not too close to center
+                if abs(x - center) > 20 or abs(y - center) > 20:
+                    break
+                attempts += 1
+            
+            if pattern_type == 'line':
+                # Horizontal or vertical line
+                length = np.random.randint(5, 10)
+                if np.random.random() < 0.5:  # Horizontal
+                    for i in range(length):
+                        if 0 <= x + i < self.size and 0 <= y < self.size:
+                            obstacles.add((x + i, y))
+                else:  # Vertical
+                    for i in range(length):
+                        if 0 <= x < self.size and 0 <= y + i < self.size:
+                            obstacles.add((x, y + i))
+            
+            elif pattern_type == 'square':
+                # Small square
+                size = np.random.randint(3, 5)
+                for i in range(size):
+                    for j in range(size):
+                        if 0 <= x + i < self.size and 0 <= y + j < self.size:
+                            obstacles.add((x + i, y + j))
+        
+        # Remove obstacles that overlap with snake starting position
+        center = self.size // 2
+        obstacles = {obs for obs in obstacles if abs(obs[0] - center) > 5 or abs(obs[1] - center) > 5}
+        
         return list(obstacles)
 
     def _getState(self):
@@ -130,30 +157,48 @@ class SnakeEnv(gym.Env):
         
         # 20-23: Additional features
         state[20] = min(len(self.snake) / 100.0, 1.0)  # Snake length (capped)
-        state[21] = min(food_dist / 1000.0, 1.0)  # Distance to food (normalized for large grid)
+        state[21] = min(food_dist / 1000.0, 1.0)  # Distance to food
         state[22] = min(self.steps / 1000.0, 1.0)  # Steps since last food
         state[23] = self.score / 100.0  # Score (normalized)
         
         return state
 
     def _placeFood(self):
-        """Optimized food placement - start close for early training"""
+        """Place food with curriculum support - closer at first"""
         head = self.snake[0]
-        for _ in range(100):
-            x = np.random.randint(0, self.size)
-            y = np.random.randint(0, self.size)
-            pos = [x, y]
-            if pos not in self.snake and (x, y) not in self.obstacles:
-                return pos
+        
+        if self.max_food_distance is None:
+            # Random placement (late training)
+            for _ in range(100):
+                x = np.random.randint(0, self.size)
+                y = np.random.randint(0, self.size)
+                pos = [x, y]
+                if pos not in self.snake and (x, y) not in self.obstacles:
+                    return pos
+        else:
+            # Curriculum: place food within max_food_distance
+            for _ in range(100):
+                offset_x = np.random.randint(-self.max_food_distance, self.max_food_distance + 1)
+                offset_y = np.random.randint(-self.max_food_distance, self.max_food_distance + 1)
+                
+                x = max(0, min(self.size - 1, head[0] + offset_x))
+                y = max(0, min(self.size - 1, head[1] + offset_y))
+                pos = [x, y]
+                
+                if pos not in self.snake and (x, y) not in self.obstacles:
+                    return pos
+        
+        # Fallback
         return [(head[0] + 10) % self.size, (head[1] + 10) % self.size]
 
     def _isCollision(self, head):
         x, y = head
         if x < 0 or y < 0 or x >= self.size or y >= self.size:
             return True
-        if head in self.snake[1:min(len(self.snake), 100)]:
+        # Only check recent body segments for large snakes (optimization)
+        check_length = min(len(self.snake), 50)
+        if head in self.snake[1:check_length]:
             return True
-        # collision with obstacles
         if (x, y) in self.obstacles:
             return True
         return False
@@ -194,64 +239,101 @@ class DQN(nn.Module):
 
 
 if __name__ == "__main__":
-    total_episodes = 6000
+    total_episodes = 5000
     
-    # Curriculum learning: start small, scale up percentually
+    # Faster curriculum progression
     curriculum = [
-        (0.0, 50),      # 0-10%: 50x50
-        (0.10, 100),    # 10-25%: 100x100
-        (0.25, 200),    # 25-40%: 200x200
-        (0.40, 500),    # 40-65%: 500x500
-        (0.65, 1000),   # 65-100%: 1000x1000
+        # (progress, grid_size, food_distance)
+        (0.0, 50, 30),       # 0-10%: tiny grid, very close food
+        (0.10, 100, 50),     # 10-25%: small grid, close food
+        (0.25, 200, 100),    # 25-40%: medium grid, medium distance
+        (0.40, 500, 200),    # 40-60%: large grid, far food
+        (0.60, 1000, 500),   # 60-80%: huge grid, very far food
+        (0.80, 1000, None),  # 80-100%: huge grid, random food
     ]
     
     state_dim = 24
     nActions = 4
     
+    # GPU setup and verification
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    print(f"\n{'='*60}")
+    print(f"GPU CONFIGURATION")
+    print(f"{'='*60}")
+    if torch.cuda.is_available():
+        print(f"✓ CUDA Available: {torch.cuda.get_device_name(0)}")
+        print(f"✓ CUDA Version: {torch.version.cuda}")
+        print(f"✓ Total VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
+        print(f"✓ Using device: {device}")
+        # Enable cuDNN auto-tuner for optimal performance
+        torch.backends.cudnn.benchmark = True
+        print(f"✓ cuDNN Benchmark: Enabled")
+    else:
+        print(f"✗ CUDA not available, using CPU (training will be VERY slow)")
+    print(f"{'='*60}\n")
     
     model = DQN(state_dim, nActions).to(device)
     target_model = DQN(state_dim, nActions).to(device)
     target_model.load_state_dict(model.state_dict())
     
+    # Verify models are on GPU
+    if torch.cuda.is_available():
+        print(f"Model parameters on GPU: {next(model.parameters()).is_cuda}")
+        print(f"Target model parameters on GPU: {next(target_model.parameters()).is_cuda}")
+    
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
-    memory = deque(maxlen=50000)
-    batchSize = 128
+    memory = deque(maxlen=100000)  # Increased buffer
+    batchSize = 512  # INCREASED: 8GB VRAM can handle this easily
     gamma = 0.99
     epsilon = 1.0
     epsilon_min = 0.01
     decay = 0.9995
-    target_update = 20
-    train_freq = 4  # Train every N steps instead of every step
+    target_update = 10
+    train_freq = 1
+    
+    # Mixed precision training for faster GPU computation
+    use_amp = torch.cuda.is_available()
+    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+    if use_amp:
+        print(f"✓ Mixed Precision Training (AMP): Enabled\n")
     
     best_score = 0
     episode_rewards = deque(maxlen=100)
+    total_steps = 0  # Track total steps for efficient training
     
-    # Start with smallest grid
+    # Start with smallest curriculum
     current_size = curriculum[0][1]
-    env = SnakeEnv(size=current_size)
+    current_food_dist = curriculum[0][2]
+    env = SnakeEnv(size=current_size, max_food_distance=current_food_dist)
+    
     print(f"Starting curriculum training over {total_episodes} episodes")
-    print(f"Initial grid: {current_size}x{current_size}")
+    print(f"Initial: {current_size}x{current_size} grid, food ±{current_food_dist} units\n")
     
     for episode in range(total_episodes):
-        # Update grid size based on curriculum percentage
+        # Update curriculum based on progress
         progress = episode / total_episodes
-        for threshold, size in curriculum:
+        for threshold, size, food_dist in curriculum:
             if progress >= threshold:
-                if size != current_size:
+                if size != current_size or food_dist != current_food_dist:
                     current_size = size
-                    env = SnakeEnv(size=current_size)
+                    current_food_dist = food_dist
+                    env = SnakeEnv(size=current_size, max_food_distance=current_food_dist)
                     percent = int(progress * 100)
-                    print(f"\n=== {percent}% - Scaling up to {current_size}x{current_size} grid (episode {episode}) ===\n")
+                    food_str = "Random" if food_dist is None else f"±{food_dist}"
+                    print(f"\n{'='*60}")
+                    print(f"CURRICULUM UPDATE - {percent}% Complete")
+                    print(f"Grid: {current_size}x{current_size} | Food: {food_str} units")
+                    print(f"Episode: {episode} | Best Score: {best_score}")
+                    print(f"{'='*60}\n")
+        
         state = env.reset()
         totalReward = 0
         steps = 0
-        step_count = 0
         
         while True:
             valid_actions = env.get_valid_actions()
             
+            # Epsilon-greedy with valid actions only
             if np.random.rand() < epsilon:
                 action = np.random.choice(valid_actions)
             else:
@@ -268,13 +350,10 @@ if __name__ == "__main__":
             state = nextState
             totalReward += reward
             steps += 1
-            step_count += 1
+            total_steps += 1
             
-            if done:
-                break
-            
-            # Training step (only every train_freq steps for speed)
-            if len(memory) > batchSize * 2 and step_count % train_freq == 0:
+            # Training step - train more frequently once we have data
+            if len(memory) >= batchSize and total_steps % train_freq == 0:
                 batch = random.sample(memory, batchSize)
                 states, actions, rewards, nextStates, dones = zip(*batch)
                 
@@ -284,18 +363,39 @@ if __name__ == "__main__":
                 nextStates = torch.FloatTensor(np.array(nextStates)).to(device)
                 dones = torch.FloatTensor(dones).to(device)
                 
-                qValues = model(states).gather(1, actions.unsqueeze(1)).squeeze(1)
-                
-                with torch.no_grad():
-                    nextQ = target_model(nextStates).max(1)[0]
-                    target = rewards + gamma * nextQ * (1 - dones)
-                
-                loss = nn.functional.mse_loss(qValues, target)
-                
-                optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
+                # Use mixed precision for faster training
+                if use_amp:
+                    with torch.cuda.amp.autocast():
+                        qValues = model(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+                        
+                        with torch.no_grad():
+                            nextQ = target_model(nextStates).max(1)[0]
+                            target = rewards + gamma * nextQ * (1 - dones)
+                        
+                        loss = nn.functional.mse_loss(qValues, target)
+                    
+                    optimizer.zero_grad()
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    qValues = model(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+                    
+                    with torch.no_grad():
+                        nextQ = target_model(nextStates).max(1)[0]
+                        target = rewards + gamma * nextQ * (1 - dones)
+                    
+                    loss = nn.functional.mse_loss(qValues, target)
+                    
+                    optimizer.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+            
+            if done:
+                break
         
         epsilon = max(epsilon_min, epsilon * decay)
         episode_rewards.append(totalReward)
@@ -307,13 +407,31 @@ if __name__ == "__main__":
             best_score = env.score
             torch.save(model.state_dict(), "snake_model_best.pth")
         
-        if episode % 50 == 0:
+        if episode % 100 == 0:
             avg_reward = np.mean(episode_rewards) if episode_rewards else 0
-            print(f"Ep {episode} [{current_size}x{current_size}]: reward={totalReward:.1f}, "
-                  f"avg={avg_reward:.1f}, score={env.score}, steps={steps}, "
-                  f"eps={epsilon:.3f}, best={best_score}")
+            food_str = "Random" if current_food_dist is None else f"±{current_food_dist}"
+            
+            # Display GPU memory usage
+            if torch.cuda.is_available():
+                memory_allocated = torch.cuda.memory_allocated(0) / 1024**3
+                memory_reserved = torch.cuda.memory_reserved(0) / 1024**3
+                print(f"Ep {episode:4d} [{current_size:4d}x{current_size:4d}, Food: {food_str:>10}] | "
+                      f"Reward: {totalReward:6.1f} | Avg: {avg_reward:6.1f} | "
+                      f"Score: {env.score:2d} | Steps: {steps:4d} | "
+                      f"Eps: {epsilon:.3f} | Best: {best_score:2d} | "
+                      f"GPU: {memory_allocated:.2f}/{memory_reserved:.2f}GB")
+            else:
+                print(f"Ep {episode:4d} [{current_size:4d}x{current_size:4d}, Food: {food_str:>10}] | "
+                      f"Reward: {totalReward:6.1f} | Avg: {avg_reward:6.1f} | "
+                      f"Score: {env.score:2d} | Steps: {steps:4d} | "
+                      f"Eps: {epsilon:.3f} | Best: {best_score:2d}")
     
     torch.save(model.state_dict(), "snake_model_final.pth")
-    print(f"\nTraining complete! Best score: {best_score}")
-    print(f"Final grid size: {current_size}x{current_size}")
-    print("Models saved as snake_model_best.pth and snake_model_final.pth")
+    print(f"\n{'='*60}")
+    print(f"TRAINING COMPLETE!")
+    print(f"Best score achieved: {best_score}")
+    print(f"Final curriculum: {current_size}x{current_size} grid")
+    print(f"Models saved: snake_model_best.pth, snake_model_final.pth")
+    if torch.cuda.is_available():
+        print(f"Peak GPU Memory: {torch.cuda.max_memory_allocated(0) / 1024**3:.2f} GB")
+    print(f"{'='*60}")
